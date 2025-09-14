@@ -2,16 +2,27 @@
 
 import * as React from "react";
 import * as THREE from "three";
+import type { ThreeEvent } from "@react-three/fiber";
 import { Canvas, useFrame, useLoader, useThree } from "@react-three/fiber";
 import { Environment, OrbitControls, Html } from "@react-three/drei";
-import { GLTFLoader } from "three-stdlib";
+import { GLTFLoader, GLTF } from "three-stdlib";
 import { acceleratedRaycast, computeBoundsTree, disposeBoundsTree } from "three-mesh-bvh";
 import type { ModelItem } from "@/data/models";
 
-// ускоряем raycast
-(THREE.Mesh as any).prototype.raycast = acceleratedRaycast;
-(THREE.BufferGeometry as any).prototype.computeBoundsTree = computeBoundsTree;
-(THREE.BufferGeometry as any).prototype.disposeBoundsTree = disposeBoundsTree;
+// enable BVH raycast without 'any'
+THREE.Mesh.prototype.raycast = acceleratedRaycast as unknown as typeof THREE.Mesh.prototype.raycast;
+THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
+THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
+
+type ExplodeUserData = {
+  startPos?: THREE.Vector3;
+  dir?: THREE.Vector3;
+  __origMat?: THREE.Material | THREE.Material[];
+};
+
+function isMesh(o: THREE.Object3D): o is THREE.Mesh {
+  return (o as THREE.Mesh).isMesh === true;
+}
 
 function ExplodableModel({
   url,
@@ -22,44 +33,55 @@ function ExplodableModel({
   settings?: ModelItem["settings"];
   k: number;
 }) {
-  const gltf = useLoader(GLTFLoader, url);
-  const root = React.useMemo(() => gltf.scene.clone(true), [gltf.scene]);
+  const gltf = useLoader(GLTFLoader, url) as GLTF;
+  const root = React.useMemo<THREE.Group>(() => gltf.scene.clone(true), [gltf.scene]);
 
-  // нормализация осей/масштаба
+  // orientation/scale
   React.useEffect(() => {
     if (settings?.yUp === false) root.rotateX(-Math.PI / 2);
     root.scale.setScalar(settings?.scale ?? 1);
   }, [root, settings]);
 
-  // подготовка explode
+  // bake explode + BVH
   React.useEffect(() => {
     const rootBox = new THREE.Box3().setFromObject(root);
     const rootC = rootBox.getCenter(new THREE.Vector3());
-    root.traverse((o: any) => {
-      if (!o.isMesh) return;
-      o.geometry.computeBoundsTree?.();
-      const box = new THREE.Box3().setFromObject(o);
+    root.traverse(obj => {
+      if (!isMesh(obj)) return;
+      obj.geometry.computeBoundsTree?.();
+      const user = obj.userData as ExplodeUserData;
+      const box = new THREE.Box3().setFromObject(obj);
       const c = box.getCenter(new THREE.Vector3());
-      o.userData.startPos = o.position.clone();
-      o.userData.dir = c.sub(rootC).normalize();
-      o.userData.__origMat = o.material;
+      user.startPos = obj.position.clone();
+      user.dir = c.sub(rootC).normalize();
+      user.__origMat = obj.material;
     });
-    return () => root.traverse((o: any) => o.isMesh && o.geometry.disposeBoundsTree?.());
+    return () => {
+      root.traverse(obj => isMesh(obj) && obj.geometry.disposeBoundsTree?.());
+    };
   }, [root]);
 
-  // применяем explode
+  // apply explode
   const prev = React.useRef(k);
   useFrame(() => {
     if (prev.current === k) return;
-    root.traverse((o: any) => {
-      if (!o.userData?.startPos || !o.userData?.dir) return;
-      o.position.copy(o.userData.startPos).addScaledVector(o.userData.dir, 0.6 * k);
-      o.updateMatrixWorld();
+    root.traverse(obj => {
+      if (!isMesh(obj)) return;
+      const user = obj.userData as ExplodeUserData;
+      if (!user.startPos || !user.dir) return;
+      obj.position.copy(user.startPos).addScaledVector(user.dir, 0.6 * k);
+      obj.updateMatrixWorld();
     });
     prev.current = k;
   });
 
-  return <primitive object={root} />;
+  // optional: selection (типизированное событие)
+  const onPointerDown = (e: ThreeEvent<MouseEvent>) => {
+    e.stopPropagation();
+    // e.object is Object3D — при желании можно подсветить
+  };
+
+  return <primitive object={root} onPointerDown={onPointerDown} />;
 }
 
 function Overlay({ k, setK }: { k: number; setK: (v: number) => void }) {
@@ -67,11 +89,10 @@ function Overlay({ k, setK }: { k: number; setK: (v: number) => void }) {
   const [fps, setFps] = React.useState(0);
   const [calls, setCalls] = React.useState(0);
 
-  // простой FPS
   React.useEffect(() => {
-    let frames = 0,
-      last = performance.now(),
-      raf = 0;
+    let frames = 0;
+    let last = performance.now();
+    let raf = 0;
     const loop = () => {
       frames++;
       const now = performance.now();
@@ -111,12 +132,11 @@ function Overlay({ k, setK }: { k: number; setK: (v: number) => void }) {
             max={1}
             step={0.01}
             value={k}
-            onChange={(e) => setK(parseFloat(e.currentTarget.value))}
+            onChange={e => setK(parseFloat(e.currentTarget.value))}
           />
         </label>
         <div style={{ marginTop: 6, fontSize: 12 }}>
-          {gl.capabilities.isWebGL2 ? "WebGL2" : "WebGL"} · DPR{" "}
-          {Math.round(window.devicePixelRatio * 10) / 10}
+          {gl.capabilities.isWebGL2 ? "WebGL2" : "WebGL"} · DPR {Math.round(window.devicePixelRatio * 10) / 10}
         </div>
       </div>
     </Html>
@@ -138,7 +158,7 @@ export default function Viewer({ model }: { model: ModelItem }) {
         overflow: "hidden"
       }}
     >
-      <Canvas dpr={[1, 2]} camera={{ position: cam as any, fov }}>
+      <Canvas dpr={[1, 2]} camera={{ position: cam as [number, number, number], fov }}>
         <color attach="background" args={["#0e0f12"]} />
         <hemisphereLight intensity={0.5} />
         <directionalLight position={[3, 3, 3]} intensity={1.1} />
@@ -147,8 +167,6 @@ export default function Viewer({ model }: { model: ModelItem }) {
           <Environment preset="city" />
         </React.Suspense>
         <OrbitControls enableDamping />
-
-        {/* ВАЖНО: Overlay внутри Canvas */}
         <Overlay k={k} setK={setK} />
       </Canvas>
     </div>
