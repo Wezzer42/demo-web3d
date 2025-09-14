@@ -24,5 +24,12 @@ export type ModelItem = {
       thumb: "/thumbs/duck.png",
       glb: "/models/duck.glb",
       settings: { yUp: true, camera: { pos: [3.0, 2.0, 3.2], fov: 45 } }
+    },
+    {
+      slug: "brainstem",
+      name: "BrainStem",
+      thumb: "/thumbs/BrainStem.gif",
+      glb: "/models/BrainStem.glb",
+      settings: { yUp: true, camera: { pos: [3.0, 2.0, 3.2], fov: 45 } }
     }
   ];

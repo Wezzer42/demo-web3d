@@ -10,7 +10,9 @@ import { GLTFLoader, GLTF, KTX2Loader, MeshoptDecoder } from "three-stdlib";
 import { acceleratedRaycast, computeBoundsTree, disposeBoundsTree } from "three-mesh-bvh";
 import type { ModelItem } from "@/data/models";
 
-/* Integrate three-mesh-bvh: faster raycasts on complex meshes */
+/* -------------------------------------------------------------
+   three-mesh-bvh integration (faster raycasting on complex meshes)
+------------------------------------------------------------- */
 THREE.Mesh.prototype.raycast = acceleratedRaycast as unknown as typeof THREE.Mesh.prototype.raycast;
 THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
 THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
@@ -40,248 +42,322 @@ const ENV_PRESETS = [
 type EnvPreset = (typeof ENV_PRESETS)[number];
 
 type Stats = { fps: number; calls: number; renderer: string; dpr: number };
+type ExplodeCache = { base: THREE.Vector3; dir: THREE.Vector3 };
 
-type ExplodeUserData = {
-  startPos?: THREE.Vector3;
-  dir?: THREE.Vector3;
-  __origMat?: THREE.Material | THREE.Material[];
-};
-
-/** Narrowing guards without `any` */
+/* ------------------------ Type guards ------------------------ */
 const isMesh = (o: THREE.Object3D): o is THREE.Mesh => (o as THREE.Mesh).isMesh === true;
-const isInstanced = (o: THREE.Object3D): o is THREE.InstancedMesh => (o as THREE.InstancedMesh).isInstancedMesh === true;
+const isInstanced = (o: THREE.Object3D): o is THREE.InstancedMesh =>
+  (o as THREE.InstancedMesh).isInstancedMesh === true;
+const isSkinned = (o: THREE.Object3D): o is THREE.SkinnedMesh =>
+  (o as THREE.SkinnedMesh).isSkinnedMesh === true;
 
-/** For reading optional material fields without `any` */
-type MaterialMaybePBR = THREE.Material & {
-  color?: THREE.Color;
-  map?: THREE.Texture;
-  side?: THREE.Side;
-};
+/* -------------------------------------------------------------
+   Geometry helpers (copy ALL attributes, safe for PBR + skinning)
+------------------------------------------------------------- */
 
-// Advanced explode with geometry subdivision for single meshes
-function createExplodeEffect(root: THREE.Group, explodeAmount: number) {
-  const rootBox = new THREE.Box3().setFromObject(root);
-  const rootCenter = rootBox.getCenter(new THREE.Vector3());
-  
-  // Collect all meshes
-  const meshes: THREE.Mesh[] = [];
-  root.traverse((obj) => {
-    if (isMesh(obj)) meshes.push(obj);
-  });
-  
-  // If only one mesh, try to subdivide it
-  if (meshes.length === 1) {
-    const mesh = meshes[0];
-    const subdivided = subdivideMesh(mesh, 4);
-    
-    if (subdivided.length > 1) {
-      // Replace original mesh with subdivided parts
-      const parent = mesh.parent;
-      if (parent) {
-        parent.remove(mesh);
-        subdivided.forEach(subMesh => {
-          parent.add(subMesh);
-          // Apply explode to each part
-          applyExplodeToMesh(subMesh, rootCenter, explodeAmount);
-        });
-      }
-      return;
-    }
-  }
-  
-  // Apply explode to all meshes
-  meshes.forEach(mesh => {
-    applyExplodeToMesh(mesh, rootCenter, explodeAmount);
-  });
-}
+/** Build a sub-geometry from a group range, copying ALL attributes (position, normal, uv, uv2, color, tangent, skinIndex, skinWeight, etc.). */
+function createSubGeometryFromGroup(
+  geom: THREE.BufferGeometry,
+  groupRange: { start: number; count: number }
+): THREE.BufferGeometry {
+  const indexAttr = geom.getIndex();
+  const srcVertexIdx: number[] = indexAttr
+    ? Array.from((indexAttr.array as ArrayLike<number>).slice(groupRange.start, groupRange.start + groupRange.count))
+    : Array.from({ length: groupRange.count }, (_, i) => groupRange.start + i);
 
-// Apply explode effect to a single mesh
-function applyExplodeToMesh(mesh: THREE.Mesh, rootCenter: THREE.Vector3, explodeAmount: number) {
-  const meshBox = new THREE.Box3().setFromObject(mesh);
-  const meshCenter = meshBox.getCenter(new THREE.Vector3());
-  
-  // Get direction vector
-  const direction = meshCenter.clone().sub(rootCenter).normalize();
-  
-  // Store original position if not already stored
-  if (!mesh.userData.originalPosition) {
-    mesh.userData.originalPosition = mesh.position.clone();
-  }
-  
-  // Apply explode offset
-  const offset = direction.multiplyScalar(explodeAmount);
-  mesh.position.copy(mesh.userData.originalPosition).add(offset);
-}
-
-// Subdivide a single mesh into multiple parts
-function subdivideMesh(mesh: THREE.Mesh, numParts: number): THREE.Mesh[] {
-  const geometry = mesh.geometry as THREE.BufferGeometry;
-  const position = geometry.getAttribute('position') as THREE.BufferAttribute;
-  
-  if (!position) return [mesh];
-  
-  // Compute bounding box
-  geometry.computeBoundingBox();
-  const bbox = geometry.boundingBox!;
-  const size = bbox.getSize(new THREE.Vector3());
-  
-  // Find the axis with the largest extent
-  const maxAxis = size.x > size.y ? (size.x > size.z ? 'x' : 'z') : (size.y > size.z ? 'y' : 'z');
-  
-  // Sort vertices by the chosen axis
-  const vertices: Array<{ index: number; value: number }> = [];
-  
-  for (let i = 0; i < position.count; i++) {
-    const pos = new THREE.Vector3();
-    pos.set(position.getX(i), position.getY(i), position.getZ(i));
-    vertices.push({
-      index: i,
-      value: pos.getComponent(maxAxis === 'x' ? 0 : maxAxis === 'y' ? 1 : 2)
-    });
-  }
-  
-  // Sort by the chosen axis
-  vertices.sort((a, b) => a.value - b.value);
-  
-  // Create subdivisions
-  const subdivisions: THREE.Mesh[] = [];
-  const verticesPerPart = Math.ceil(vertices.length / numParts);
-  
-  for (let part = 0; part < numParts; part++) {
-    const startIdx = part * verticesPerPart;
-    const endIdx = Math.min(startIdx + verticesPerPart, vertices.length);
-    
-    if (startIdx >= vertices.length) break;
-    
-    // Get vertex indices for this part
-    const partIndices = vertices.slice(startIdx, endIdx).map(v => v.index);
-    const partSet = new Set(partIndices);
-    
-    // Find triangles that belong to this part
-    const partTriangles: number[] = [];
-    const index = geometry.getIndex();
-    
-    if (index) {
-      for (let i = 0; i < index.count; i += 3) {
-        const a = index.getX(i);
-        const b = index.getX(i + 1);
-        const c = index.getX(i + 2);
-        
-        if (partSet.has(a) || partSet.has(b) || partSet.has(c)) {
-          partTriangles.push(a, b, c);
-        }
-      }
-    } else {
-      for (let i = 0; i < position.count; i += 3) {
-        if (partSet.has(i) || partSet.has(i + 1) || partSet.has(i + 2)) {
-          partTriangles.push(i, i + 1, i + 2);
-        }
-      }
-    }
-    
-    if (partTriangles.length === 0) continue;
-    
-    // Create new geometry for this part
-    const partGeometry = createSubGeometry(geometry, partTriangles);
-    
-    // Create mesh for this part
-    const partMesh = new THREE.Mesh(partGeometry, mesh.material);
-    partMesh.position.copy(mesh.position);
-    partMesh.quaternion.copy(mesh.quaternion);
-    partMesh.scale.copy(mesh.scale);
-    partMesh.castShadow = true;
-    partMesh.receiveShadow = true;
-    
-    subdivisions.push(partMesh);
-  }
-  
-  return subdivisions.length > 1 ? subdivisions : [mesh];
-}
-
-// Create sub-geometry from triangle indices
-function createSubGeometry(originalGeometry: THREE.BufferGeometry, triangleIndices: number[]): THREE.BufferGeometry {
-  const position = originalGeometry.getAttribute('position') as THREE.BufferAttribute;
-  const normal = originalGeometry.getAttribute('normal') as THREE.BufferAttribute | null;
-  const uv = originalGeometry.getAttribute('uv') as THREE.BufferAttribute | null;
-  
-  // Remap indices to compact vertex array
-  const vertexMap = new Map<number, number>();
-  const newPositions: number[] = [];
-  const newNormals: number[] = [];
-  const newUvs: number[] = [];
+  const remap = new Map<number, number>();
   const newIndices: number[] = [];
-  
-  let newVertexIndex = 0;
-  
-  for (let i = 0; i < triangleIndices.length; i += 3) {
-    const indices = [triangleIndices[i], triangleIndices[i + 1], triangleIndices[i + 2]];
-    
-    for (const oldIndex of indices) {
-      if (!vertexMap.has(oldIndex)) {
-        vertexMap.set(oldIndex, newVertexIndex++);
-        
-        // Copy position
-        const pos = new THREE.Vector3();
-        pos.set(position.getX(oldIndex), position.getY(oldIndex), position.getZ(oldIndex));
-        newPositions.push(pos.x, pos.y, pos.z);
-        
-        // Copy normal if available
-        if (normal) {
-          const norm = new THREE.Vector3();
-          norm.set(normal.getX(oldIndex), normal.getY(oldIndex), normal.getZ(oldIndex));
-          newNormals.push(norm.x, norm.y, norm.z);
+  for (const oi of srcVertexIdx) {
+    let ni = remap.get(oi);
+    if (ni === undefined) {
+      ni = remap.size;
+      remap.set(oi, ni);
+    }
+    newIndices.push(ni);
+  }
+  const vertCount = remap.size;
+
+  const oldByNew: number[] = [];
+  remap.forEach((ni, oi) => {
+    oldByNew[ni] = oi;
+  });
+
+  const dst = new THREE.BufferGeometry();
+  const attrs = geom.attributes as Record<string, THREE.BufferAttribute>;
+
+  for (const name of Object.keys(attrs)) {
+    const a = attrs[name];
+    if (!a?.isBufferAttribute) continue;
+    const itemSize = a.itemSize;
+    const out = new Float32Array(vertCount * itemSize);
+    for (let ni = 0; ni < vertCount; ni++) {
+      const oi = oldByNew[ni];
+      for (let k = 0; k < itemSize; k++) {
+        out[ni * itemSize + k] = (a.array as unknown as number[])[oi * itemSize + k];
+      }
+    }
+    dst.setAttribute(name, new THREE.BufferAttribute(out, itemSize));
+  }
+
+  const idxArray = vertCount > 65535 ? new Uint32Array(newIndices) : new Uint16Array(newIndices);
+  dst.setIndex(new THREE.BufferAttribute(idxArray, 1));
+  dst.computeBoundingBox();
+  dst.computeBoundingSphere();
+  return dst;
+}
+
+/** Split a SkinnedMesh by geometry.groups into multiple SkinnedMesh, all bound to the same Skeleton. */
+function splitSkinnedByGroups(skinned: THREE.SkinnedMesh): THREE.SkinnedMesh[] {
+  const geom = skinned.geometry as THREE.BufferGeometry;
+  const groups = geom.groups ?? [];
+  if (!groups.length) return [skinned];
+
+  const mats = Array.isArray(skinned.material) ? skinned.material : [skinned.material];
+  const parts: THREE.SkinnedMesh[] = [];
+
+  for (const g of groups) {
+    const sub = createSubGeometryFromGroup(geom, { start: g.start, count: g.count });
+    const mat = mats[g.materialIndex ?? 0] ?? mats[0];
+    const m = new THREE.SkinnedMesh(sub, mat);
+    m.castShadow = true;
+    m.receiveShadow = true;
+    m.position.copy(skinned.position);
+    m.quaternion.copy(skinned.quaternion);
+    m.scale.copy(skinned.scale);
+    m.bind(skinned.skeleton, skinned.bindMatrix.clone());
+    parts.push(m);
+  }
+  return parts;
+}
+
+/** Split a non-skinned geometry into up to 8 parts by triangle centroid octants (relative to bbox center). */
+function splitByOctants(src: THREE.BufferGeometry): THREE.BufferGeometry[] {
+  src.computeBoundingBox();
+  const center = src.boundingBox ? src.boundingBox.getCenter(new THREE.Vector3()) : new THREE.Vector3();
+
+  const index = src.getIndex();
+  const pos = src.getAttribute("position") as THREE.BufferAttribute;
+  const triCount = index ? index.count / 3 : pos.count / 3;
+
+  const buckets: number[][] = Array.from({ length: 8 }, () => []);
+
+  for (let t = 0; t < triCount; t++) {
+    const i0 = index ? index.getX(3 * t) : 3 * t;
+    const i1 = index ? index.getX(3 * t + 1) : 3 * t + 1;
+    const i2 = index ? index.getX(3 * t + 2) : 3 * t + 2;
+
+    const cx = (pos.getX(i0) + pos.getX(i1) + pos.getX(i2)) / 3;
+    const cy = (pos.getY(i0) + pos.getY(i1) + pos.getY(i2)) / 3;
+    const cz = (pos.getZ(i0) + pos.getZ(i1) + pos.getZ(i2)) / 3;
+
+    const ox = cx >= center.x ? 1 : 0;
+    const oy = cy >= center.y ? 1 : 0;
+    const oz = cz >= center.z ? 1 : 0;
+    const id = (ox << 2) | (oy << 1) | oz; // 0..7
+
+    buckets[id].push(i0, i1, i2);
+  }
+
+  return buckets.filter((b) => b.length).map((b) => {
+    // Reuse the generic builder that copies ALL attributes
+    const geom = new THREE.BufferGeometry();
+    // Convert triangle vertex indices into a flat vertex index list
+    // createSubGeometryFromGroup expects a contiguous slice; for buckets we mimic by custom copier:
+    return createSubGeometryFromIndices(src, b);
+  });
+}
+
+/** Generic sub-geometry builder from an explicit vertex index list (copies ALL attributes). */
+function createSubGeometryFromIndices(original: THREE.BufferGeometry, vertexIndices: number[]): THREE.BufferGeometry {
+  const attrs = original.attributes as Record<string, THREE.BufferAttribute>;
+  const remap = new Map<number, number>();
+  const newIndices: number[] = [];
+
+  for (const oi of vertexIndices) {
+    let ni = remap.get(oi);
+    if (ni === undefined) {
+      ni = remap.size;
+      remap.set(oi, ni);
+    }
+    newIndices.push(ni);
+  }
+  const vertCount = remap.size;
+
+  const oldByNew: number[] = [];
+  remap.forEach((ni, oi) => {
+    oldByNew[ni] = oi;
+  });
+
+  const dst = new THREE.BufferGeometry();
+
+  for (const name of Object.keys(attrs)) {
+    const a = attrs[name];
+    if (!a?.isBufferAttribute) continue;
+    const itemSize = a.itemSize;
+    const out = new Float32Array(vertCount * itemSize);
+    for (let ni = 0; ni < vertCount; ni++) {
+      const oi = oldByNew[ni];
+      for (let k = 0; k < itemSize; k++) {
+        out[ni * itemSize + k] = (a.array as unknown as number[])[oi * itemSize + k];
+      }
+    }
+    dst.setAttribute(name, new THREE.BufferAttribute(out, itemSize));
+  }
+
+  const idxArray = vertCount > 65535 ? new Uint32Array(newIndices) : new Uint16Array(newIndices);
+  dst.setIndex(new THREE.BufferAttribute(idxArray, 1));
+  dst.computeBoundingBox();
+  dst.computeBoundingSphere();
+  return dst;
+}
+
+/* -------------------------------------------------------------
+   Explode logic
+   - Parent-local directions
+   - Distance scales by scene radius
+   - One-time preparation (split skinned by groups; split single-mesh by groups or octants)
+------------------------------------------------------------- */
+
+function applyExplodeOffset(mesh: THREE.Mesh, rootCenterWorld: THREE.Vector3, dist: number) {
+  const parent = mesh.parent ?? mesh;
+  const box = new THREE.Box3().setFromObject(mesh);
+  const meshCenterWorld = box.getCenter(new THREE.Vector3());
+  const meshCenterLocal = parent.worldToLocal(meshCenterWorld.clone());
+  const rootCenterLocal = parent.worldToLocal(rootCenterWorld.clone());
+
+  const dir = meshCenterLocal.sub(rootCenterLocal);
+  if (dir.lengthSq() < 1e-12) dir.set(0, 1, 0);
+  dir.normalize();
+
+  const uc = mesh.userData as { __explode?: ExplodeCache };
+  if (!uc.__explode) {
+    uc.__explode = { base: mesh.position.clone(), dir: dir.clone() };
+  } else {
+    uc.__explode.dir.copy(dir);
+  }
+
+  mesh.position.copy(uc.__explode.base).addScaledVector(uc.__explode.dir, dist);
+  mesh.updateMatrixWorld();
+}
+
+function createExplodeEffect(root: THREE.Group, k: number) {
+  // Distance scaled by scene radius
+  const rootBox = new THREE.Box3().setFromObject(root);
+  const rootCenterWorld = rootBox.getCenter(new THREE.Vector3());
+  const rootRadius = rootBox.getSize(new THREE.Vector3()).length() * 0.5;
+  const dist = k * rootRadius; // k in 0..1
+
+  // One-time preparation: split meshes as needed
+  const preparedFlag = (root.userData as { __prepared?: boolean }).__prepared;
+  if (!preparedFlag) {
+    const toAdd: { parent: THREE.Object3D; parts: THREE.Object3D[]; remove: THREE.Object3D }[] = [];
+
+    root.traverse((o) => {
+      // Skinned: split by geometry.groups into multiple SkinnedMesh
+      if (isSkinned(o)) {
+        const sk = o as THREE.SkinnedMesh;
+        const groups = (sk.geometry as THREE.BufferGeometry).groups ?? [];
+        if (groups.length > 1 && sk.parent) {
+          const parts = splitSkinnedByGroups(sk);
+          toAdd.push({ parent: sk.parent, parts, remove: sk });
         }
-        
-        // Copy UV if available
-        if (uv) {
-          const uvCoords = new THREE.Vector2();
-          uvCoords.set(uv.getX(oldIndex), uv.getY(oldIndex));
-          newUvs.push(uvCoords.x, uvCoords.y);
+        return;
+      }
+
+      // Non-skinned single mesh with no groups: optional octant split for demo visibility
+      if (isMesh(o) && !isInstanced(o)) {
+        const m = o as THREE.Mesh;
+        const geom = m.geometry as THREE.BufferGeometry;
+        const groups = geom.groups ?? [];
+        if (groups.length <= 1 && m.parent) {
+          const subs = splitByOctants(geom);
+          if (subs.length > 1) {
+            const parts = subs.map((g) => {
+              const child = new THREE.Mesh(g, m.material);
+              child.castShadow = true;
+              child.receiveShadow = true;
+              child.position.copy(m.position);
+              child.quaternion.copy(m.quaternion);
+              child.scale.copy(m.scale);
+              return child;
+            });
+            toAdd.push({ parent: m.parent, parts, remove: m });
+          }
         }
       }
-      
-      newIndices.push(vertexMap.get(oldIndex)!);
+    });
+
+    for (const op of toAdd) {
+      op.parent.remove(op.remove);
+      op.parts.forEach((p) => op.parent.add(p));
     }
+    (root.userData as { __prepared?: boolean }).__prepared = true;
   }
-  
-  // Create new geometry
-  const subGeometry = new THREE.BufferGeometry();
-  subGeometry.setAttribute('position', new THREE.Float32BufferAttribute(newPositions, 3));
-  if (newNormals.length > 0) {
-    subGeometry.setAttribute('normal', new THREE.Float32BufferAttribute(newNormals, 3));
-  }
-  if (newUvs.length > 0) {
-    subGeometry.setAttribute('uv', new THREE.Float32BufferAttribute(newUvs, 2));
-  }
-  subGeometry.setIndex(newIndices);
-  
-  subGeometry.computeBoundingBox();
-  subGeometry.computeBoundingSphere();
-  
-  return subGeometry;
+
+  // Apply offsets to every mesh
+  const all: THREE.Mesh[] = [];
+  root.traverse((o) => {
+    const m = o as THREE.Mesh;
+    if (m.isMesh) all.push(m);
+  });
+
+  for (const m of all) applyExplodeOffset(m, rootCenterWorld, dist);
+}
+
+/* -------------------------------------------------------------
+   Explode capability detector (to disable UI when it’s pointless)
+------------------------------------------------------------- */
+function getExplodeCapability(root: THREE.Object3D) {
+  let meshCount = 0;
+  let groupSum = 0;
+  let hasSkinnedWithGroups = false;
+  let hasOnlySkinnedSinglePrimitive = false;
+
+  root.traverse((o) => {
+    if (isSkinned(o)) {
+      const groups = (o.geometry as THREE.BufferGeometry).groups ?? [];
+      if (groups.length > 1) hasSkinnedWithGroups = true;
+      else hasOnlySkinnedSinglePrimitive = true;
+    }
+    if (isMesh(o)) {
+      meshCount++;
+      groupSum += (o.geometry as THREE.BufferGeometry).groups?.length ?? 0;
+    }
+  });
+
+  // Can explode if: multiple meshes OR any geometry has groups OR skinned has groups
+  const can = meshCount > 1 || groupSum > 1 || hasSkinnedWithGroups;
+  const reason = can ? "" : hasOnlySkinnedSinglePrimitive ? "skinned-single-primitive" : "single-primitive";
+  return { canExplode: can, reason };
 }
 
 /* ============================================================
    ExplodableModel
-   - Normal mode: renders original scene as-is (keeps custom shaders).
-   - Explode mode: builds and renders a separate exploded clone with
-     safe MeshStandard/Physical materials, never touching the original.
-   ============================================================ */
+   - Loads model, enables BVH & shadows
+   - Explode distance scales with scene size
+   - One-time split where applicable
+============================================================ */
 function ExplodableModel({
   url,
   settings,
-  k
+  k,
+  onExplodeDetect
 }: {
   url: string;
   settings?: ModelItem["settings"];
-  k: number;
+  k: number; // 0..1
+  onExplodeDetect: (can: boolean) => void;
 }) {
   const { gl } = useThree();
-  const gltf = useLoader(GLTFLoader, url, loader => {
-    const ktx2 = new KTX2Loader().setTranscoderPath("/basis/").detectSupport(gl);
-    (loader as GLTFLoader).setKTX2Loader(ktx2);
-    (loader as GLTFLoader).setMeshoptDecoder(MeshoptDecoder);
-  }) as GLTF;
+  const gltf = useLoader(
+    GLTFLoader,
+    url,
+    (loader) => {
+      const ktx2 = new KTX2Loader().setTranscoderPath("/basis/").detectSupport(gl);
+      (loader as GLTFLoader).setKTX2Loader(ktx2);
+      (loader as GLTFLoader).setMeshoptDecoder(MeshoptDecoder);
+    }
+  ) as GLTF;
 
   const root = React.useMemo<THREE.Group>(() => gltf.scene.clone(true), [gltf.scene]);
 
@@ -292,24 +368,35 @@ function ExplodableModel({
     root.updateWorldMatrix(true, true);
   }, [root, settings]);
 
-  // Enable shadows and BVH
+  // BVH + shadows
   React.useEffect(() => {
-    root.traverse(obj => {
+    root.traverse((obj) => {
       if (!isMesh(obj)) return;
       obj.geometry.computeBoundsTree?.();
       obj.castShadow = true;
       obj.receiveShadow = true;
     });
-
-    return () => { root.traverse(obj => isMesh(obj) && obj.geometry.disposeBoundsTree?.()); };
+    return () => {
+      root.traverse((obj) => {
+        if (isMesh(obj)) obj.geometry.disposeBoundsTree?.();
+      });
+    };
   }, [root]);
 
-  // Apply explode effect
+  // Detect capability once model is ready
   React.useEffect(() => {
-    createExplodeEffect(root, k * 2); // multiply by 2 for more visible effect
+    const { canExplode } = getExplodeCapability(root);
+    onExplodeDetect(canExplode);
+  }, [root, onExplodeDetect]);
+
+  // Apply explode (idempotent; preparation happens only once)
+  React.useEffect(() => {
+    createExplodeEffect(root, k);
   }, [root, k]);
 
-  const onPointerDown = (e: ThreeEvent<MouseEvent>) => { e.stopPropagation(); };
+  const onPointerDown = (e: ThreeEvent<MouseEvent>) => {
+    e.stopPropagation();
+  };
   return <primitive object={root} onPointerDown={onPointerDown} />;
 }
 
@@ -341,6 +428,7 @@ function ControlPanel({
   stats,
   k,
   setK,
+  canExplode,
   envPreset,
   setEnvPreset,
   exposure,
@@ -351,6 +439,7 @@ function ControlPanel({
   stats: Stats;
   k: number;
   setK: (v: number) => void;
+  canExplode: boolean;
   envPreset: EnvPreset;
   setEnvPreset: (v: EnvPreset) => void;
   exposure: number;
@@ -378,8 +467,8 @@ function ControlPanel({
       id,
       type,
       color: "#ffffff",
-      intensity: type === "ambient" ? 0.3 : 1.2,
-      position: type === "directional" || type === "point" ? [3, 4, 3] : undefined
+      intensity: type === "ambient" ? 0.35 : 1.6,
+      position: type === "directional" || type === "point" ? [4, 6, 4] : undefined
     };
     setLights((ls) => [...ls, base]);
     setSel(id);
@@ -396,14 +485,14 @@ function ControlPanel({
         position: "fixed",
         right: 16,
         top: 16,
-        width: 320,
+        width: 340,
         zIndex: 50,
         background: "rgba(13,16,22,0.9)",
         backdropFilter: "blur(6px)",
         border: "1px solid #2b2f3a",
         borderRadius: 12,
         color: "#fff",
-        padding: 10,
+        padding: 12,
         fontFamily: "ui-monospace,monospace"
       }}
     >
@@ -414,6 +503,7 @@ function ControlPanel({
         </span>
       </div>
 
+      {/* Explode slider (disabled if not applicable) */}
       <label style={{ display: "grid", gridTemplateColumns: "90px 1fr", gap: 8, alignItems: "center" }}>
         <span>Explode</span>
         <input
@@ -421,14 +511,22 @@ function ControlPanel({
           min={0}
           max={1}
           step={0.01}
-          value={k} 
+          value={k}
           onChange={(e) => setK(parseFloat(e.target.value))}
+          disabled={!canExplode}
           style={{ accentColor: "#1b88ff" }}
         />
       </label>
+      {!canExplode && (
+        <div style={{ marginTop: 4, fontSize: 11, color: "#9aa4b2" }}>
+          Explode is unavailable for this model.
+        </div>
+      )}
 
       {/* Exposure and environment */}
-      <label style={{ display: "grid", gridTemplateColumns: "90px 1fr", gap: 8, alignItems: "center", marginTop: 8 }}>
+      <label
+        style={{ display: "grid", gridTemplateColumns: "90px 1fr", gap: 8, alignItems: "center", marginTop: 8 }}
+      >
         <span>Exposure</span>
         <input
           type="range"
@@ -441,10 +539,12 @@ function ControlPanel({
         />
       </label>
 
-      <label style={{ display: "grid", gridTemplateColumns: "90px 1fr", gap: 8, alignItems: "center", marginTop: 8 }}>
+      <label
+        style={{ display: "grid", gridTemplateColumns: "90px 1fr", gap: 8, alignItems: "center", marginTop: 8 }}
+      >
         <span>Environment</span>
-        <select 
-          value={envPreset} 
+        <select
+          value={envPreset}
           onChange={(e) => setEnvPreset(e.target.value as EnvPreset)}
           style={{
             background: "#1a1d26",
@@ -465,11 +565,15 @@ function ControlPanel({
       </label>
 
       {/* Lights */}
-      <div style={{ display: "flex", gap: 4, marginTop: 6, flexWrap: "wrap" }}>
+      <div style={{ display: "flex", gap: 6, marginTop: 8, flexWrap: "wrap" }}>
         <button onClick={() => addLight("ambient")} className="btn" style={{ fontSize: "11px", padding: "4px 6px" }}>
           + Ambient
         </button>
-        <button onClick={() => addLight("directional")} className="btn" style={{ fontSize: "11px", padding: "4px 6px" }}>
+        <button
+          onClick={() => addLight("directional")}
+          className="btn"
+          style={{ fontSize: "11px", padding: "4px 6px" }}
+        >
           + Directional
         </button>
         <button onClick={() => addLight("point")} className="btn" style={{ fontSize: "11px", padding: "4px 6px" }}>
@@ -477,7 +581,7 @@ function ControlPanel({
         </button>
       </div>
 
-      <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginTop: 6 }}>
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 8 }}>
         {lights.map((l) => (
           <button
             key={l.id}
@@ -495,21 +599,30 @@ function ControlPanel({
           </button>
         ))}
         {selected && (
-          <button onClick={delLight} className="btn" style={{ marginLeft: "auto", background: "#d32f2f", fontSize: "11px", padding: "3px 6px" }}>
+          <button
+            onClick={delLight}
+            className="btn"
+            style={{ marginLeft: "auto", background: "#d32f2f", fontSize: "11px", padding: "3px 6px" }}
+          >
             Delete
           </button>
         )}
       </div>
 
       {selected && (
-        <div style={{ display: "grid", gap: 6, marginTop: 6, padding: 6, border: "1px solid #3a3f4b", borderRadius: 6 }}>
+        <div style={{ display: "grid", gap: 6, marginTop: 8, padding: 6, border: "1px solid #3a3f4b", borderRadius: 6 }}>
           <div style={{ display: "grid", gridTemplateColumns: "70px 1fr", gap: 6, alignItems: "center" }}>
             <span style={{ fontSize: "11px" }}>Type</span>
             <code style={{ fontSize: "11px" }}>{selected.type}</code>
           </div>
           <label style={{ display: "grid", gridTemplateColumns: "70px 1fr", gap: 6, alignItems: "center" }}>
             <span style={{ fontSize: "11px" }}>Color</span>
-            <input type="color" value={selected.color} onChange={(e) => upd({ color: e.target.value })} style={{ width: "100%", height: "24px" }} />
+            <input
+              type="color"
+              value={selected.color}
+              onChange={(e) => upd({ color: e.target.value })}
+              style={{ width: "100%", height: "24px" }}
+            />
           </label>
           <label style={{ display: "grid", gridTemplateColumns: "70px 1fr", gap: 6, alignItems: "center" }}>
             <span style={{ fontSize: "11px" }}>Intensity</span>
@@ -531,11 +644,11 @@ function ControlPanel({
                   <input
                     type="number"
                     step={0.1}
-                    value={(selected.position ?? [3, 4, 3])[idx]}
-                    onChange={(e) => updPos(idx as 0 | 1 | 2, parseFloat(e.target.value) || 0)}
-                    style={{ 
-                      width: "100%", 
-                      padding: "2px 4px", 
+                    value={(selected.position ?? [4, 6, 4])[idx]}
+                    onChange={(e) => updPos(idx as 0 | 1 | 2, Number.isFinite(+e.target.value) ? parseFloat(e.target.value) : 0)}
+                    style={{
+                      width: "100%",
+                      padding: "2px 4px",
                       fontSize: "11px",
                       background: "#1a1d26",
                       border: "1px solid #3a3f4b",
@@ -570,12 +683,12 @@ function ControlPanel({
 
 /* ---------------------- Viewer root ---------------------- */
 export default function Viewer({ model }: { model: ModelItem }) {
-  const [k, setK] = React.useState(0);
+  const [k, setK] = React.useState(0); // 0..1
   const [envPreset, setEnvPreset] = React.useState<EnvPreset>("city");
-  const [exposure, setExposure] = React.useState(1.0);
+  const [exposure, setExposure] = React.useState(1.2);
+  const [canExplode, setCanExplode] = React.useState(false);
+
   const [lights, setLights] = React.useState<LightDef[]>([
-    { id: "amb", type: "ambient", color: "#ffffff", intensity: 0.35 },
-    { id: "key", type: "directional", color: "#ffffff", intensity: 1.8, position: [4, 6, 4] }
   ]);
   const [stats, setStats] = React.useState<Stats>({ fps: 0, calls: 0, renderer: "WebGL", dpr: 1 });
 
@@ -596,6 +709,7 @@ export default function Viewer({ model }: { model: ModelItem }) {
         stats={stats}
         k={k}
         setK={setK}
+        canExplode={canExplode}
         envPreset={envPreset}
         setEnvPreset={setEnvPreset}
         exposure={exposure}
@@ -642,13 +756,20 @@ export default function Viewer({ model }: { model: ModelItem }) {
             );
           }
           if (l.type === "point") {
-            return <pointLight key={l.id} castShadow color={l.color} intensity={l.intensity} position={l.position ?? [2, 2, 2]} />;
+            return (
+              <pointLight key={l.id} castShadow color={l.color} intensity={l.intensity} position={l.position ?? [2, 2, 2]} />
+            );
           }
           return null;
         })}
 
         <React.Suspense fallback={null}>
-          <ExplodableModel url={model.glb} settings={model.settings} k={k} />
+          <ExplodableModel
+            url={model.glb}
+            settings={model.settings}
+            k={k}
+            onExplodeDetect={setCanExplode}
+          />
           <Environment preset={envPreset} />
         </React.Suspense>
 
