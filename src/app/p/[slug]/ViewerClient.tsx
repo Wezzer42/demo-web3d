@@ -46,7 +46,6 @@ type ExplodeData = { basePos: THREE.Vector3; dir: THREE.Vector3 };
 
 /** Narrowing guards without `any` */
 const isMesh = (o: THREE.Object3D): o is THREE.Mesh => (o as THREE.Mesh).isMesh === true;
-const isSkinned = (o: THREE.Object3D): o is THREE.SkinnedMesh => (o as THREE.SkinnedMesh).isSkinnedMesh === true;
 const isInstanced = (o: THREE.Object3D): o is THREE.InstancedMesh => (o as THREE.InstancedMesh).isInstancedMesh === true;
 
 /** For reading optional material fields without `any` */
@@ -340,8 +339,8 @@ function ExplodableModel({
       meshTypes: meshes.map(m => ({
         type: m.type,
         isMesh: m.isMesh,
-        isSkinned: (m as any).isSkinnedMesh,
-        isInstanced: (m as any).isInstancedMesh,
+        isSkinned: (m as THREE.SkinnedMesh).isSkinnedMesh || false,
+        isInstanced: (m as THREE.InstancedMesh).isInstancedMesh || false,
         geometryGroups: m.geometry?.groups?.length || 0,
         hasGeometry: !!m.geometry
       })),
@@ -402,7 +401,7 @@ function ExplodableModel({
         
         if (subdividedMeshes.length > 1) {
           console.log(`Successfully subdivided into ${subdividedMeshes.length} parts`);
-          subdividedMeshes.forEach((subMesh, index) => {
+          subdividedMeshes.forEach((subMesh) => {
             // Calculate direction from submesh center to assembly center
             const subBox = new THREE.Box3().setFromObject(subMesh);
             const subCenter = subBox.getCenter(new THREE.Vector3());
@@ -527,7 +526,7 @@ function ExplodableModel({
     // No meshes: still set empty group to keep toggle stable
     console.log('No meshes found, setting empty exploded group');
     setExplodedGroup(cloneRoot);
-  }, [explode, amount, origRoot]); // rebuild when toggling or when we want initial offsets to reflect amount
+  }, [explode, amount, origRoot, subdivisionParts]); // rebuild when toggling or when we want initial offsets to reflect amount
 
   /** Update positions when slider changes without rebuilding geometry */
   useFrame(() => {
