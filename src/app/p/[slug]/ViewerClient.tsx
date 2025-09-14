@@ -61,9 +61,17 @@ function createSubGeometryFromGroup(
   groupRange: { start: number; count: number }
 ): THREE.BufferGeometry {
   const indexAttr = geom.getIndex();
-  const srcVertexIdx: number[] = indexAttr
-    ? Array.from((indexAttr.array as ArrayLike<number>).slice(groupRange.start, groupRange.start + groupRange.count))
-    : Array.from({ length: groupRange.count }, (_, i) => groupRange.start + i);
+  let srcVertexIdx: number[] = [];
+
+  if (indexAttr) {
+    // Read indices via BufferAttribute API; no typing drama, works on all platforms
+    srcVertexIdx = Array.from({ length: groupRange.count }, (_, i) =>
+      indexAttr.getX(groupRange.start + i)
+    );
+  } else {
+    // Non-indexed geometry: the group range already addresses vertex indices directly
+    srcVertexIdx = Array.from({ length: groupRange.count }, (_, i) => groupRange.start + i);
+  }
 
   const remap = new Map<number, number>();
   const newIndices: number[] = [];
